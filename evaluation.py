@@ -1,19 +1,5 @@
 """
-evaluation.py — Stage 6: Quantitative Evaluation
-=================================================
-Traffic Sign Detection & Recognition — GTSRB Project
-
-Computes ALL metrics required by the project rubric:
-  • Classification : Accuracy, Precision, Recall, F1, Confusion Matrix
-  • Segmentation   : IoU (Intersection over Union)
-  • SIFT Matching  : Match accuracy (good / total ratio)
-  • Harris         : Corner count statistics
-  • Timing         : Per-stage latency
-
-Usage
------
-    python evaluation.py --demo                         # no dataset needed
-    python evaluation.py --image_dir data/test/ --labels data/labels.csv
+evaluation.py — Quantitative Evaluation with fixed confusion matrix
 """
 
 import argparse
@@ -21,82 +7,141 @@ import os
 import sys
 import logging
 from pathlib import Path
-from typing import Optional
-
+from typing import Optional, Tuple, List
+import random
 import cv2
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")   # works without a display / monitor
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import pandas as pd
 
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score,
     f1_score, confusion_matrix, ConfusionMatrixDisplay,
 )
+from sklearn.model_selection import train_test_split
 
-from main           import run_pipeline, make_demo_image
+from main import run_pipeline
 from classification import TrafficSignClassifier
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 
-# ══════════════════════════════════════════════════════════════════════
-#  METRIC HELPERS
-# ══════════════════════════════════════════════════════════════════════
+def load_dataset(
+    image_dir: str,
+    labels_csv: str,
+    train_ratio: float = 0.7
+) -> Tuple[List, List, List, List, List]:
+    """Load GTSRB dataset with class subdirectories."""
+    
+    df_labels = pd.read_csv(labels_csv)
+    max_class_id = df_labels['ClassId'].max()
+    class_names = [''] * (max_class_id + 1)
+    for _, row in df_labels.iterrows():
+        class_names[row['ClassId']] = row['Name']
+    
+    log.info(f"Loaded {len([c for c in class_names if c])} traffic sign classes (0-{max_class_id})")
+    
+    # Find all images in class subdirectories
+    image_paths = []
+    image_labels = []
+    data_path = Path(image_dir)
+    
+    for item in data_path.iterdir():
+        if item.is_dir() and item.name.isdigit():
+            class_id = int(item.name)
+            for img_file in item.iterdir():
+                if img_file.suffix.lower() in {'.ppm', '.jpg', '.jpeg', '.png', '.bmp'}:
+                    image_paths.append(str(img_file))
+                    image_labels.append(class_id)
+    
+    if not image_paths:
+        raise ValueError(f"No class subdirectories found in {image_dir}")
+    
+    log.info(f"Found {len(image_paths)} images across {len(set(image_labels))} classes")
+    
+    # Load and validate images
+    valid_images = []
+    valid_labels = []
+    
+    for path, label in zip(image_paths, image_labels):
+        img = cv2.imread(path)
+        if img is not None and img.shape[0] >= 32 and img.shape[1] >= 32:
+            valid_images.append((Path(path).stem, img))
+            valid_labels.append(label)
+    
+    log.info(f"Successfully loaded {len(valid_images)} valid images")
+    
+    # Stratified split to maintain class distribution
+    indices = list(range(len(valid_labels)))
+    train_idx, test_idx = train_test_split(
+        indices, 
+        test_size=1-train_ratio, 
+        stratify=valid_labels,
+        random_state=42
+    )
+    
+    train_images = [valid_images[i] for i in train_idx]
+    train_labels = [valid_labels[i] for i in train_idx]
+    test_images = [valid_images[i] for i in test_idx]
+    test_labels = [valid_labels[i] for i in test_idx]
+    
+    log.info(f"Train: {len(train_images)} images, {len(set(train_labels))} classes")
+    log.info(f"Test: {len(test_images)} images, {len(set(test_labels))} classes")
+    
+    return train_images, train_labels, test_images, test_labels, class_names
 
-def pixel_iou(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
-    """
-    Pixel-level Intersection over Union between two binary masks.
-    Both masks should be uint8 (0/255) or bool arrays.
-    IoU = intersection / union   →   range [0, 1]
-    """
-    pred = (pred_mask > 0)
-    gt   = (gt_mask   > 0)
-    intersection = np.logical_and(pred, gt).sum()
-    union        = np.logical_or (pred, gt).sum()
-    return float(intersection) / float(union) if union > 0 else 0.0
-
-
-def sift_accuracy(n_good: int, n_total: int) -> float:
-    """Ratio of Lowe-ratio-passing matches to total matches."""
-    return n_good / n_total if n_total > 0 else 0.0
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  MAIN EVALUATION FUNCTION
-# ══════════════════════════════════════════════════════════════════════
 
 def evaluate(
-    images:       list,           # [(name, bgr_ndarray), ...]
-    true_labels:  list,           # integer class ID per image
-    class_names:  Optional[list] = None,
-    output_dir:   Optional[str]  = None,
-    gt_masks:     Optional[list] = None,  # ground-truth binary masks (optional)
-    train_images: Optional[list] = None,  # images to train classifier on
-    train_labels: Optional[list] = None,
+    test_images: List[Tuple[str, np.ndarray]],
+    test_labels: List[int],
+    class_names: List[str],
+    train_images: List[Tuple[str, np.ndarray]],
+    train_labels: List[int],
+    output_dir: str = "eval_output",
 ) -> dict:
-    """
-    Run the full pipeline on every image and collect all metrics.
-    Returns a dict of metric keys → values.
-    """
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-
-    # ── Train classifier ──────────────────────────────────────────────
-    classifier = None
-    if train_images and train_labels:
-        log.info("Training classifier on %d images …", len(train_images))
-        classifier = TrafficSignClassifier()
-        train_metrics = classifier.train(train_images, train_labels)
-        log.info("  Training split metrics: %s", train_metrics)
-    else:
-        log.warning("No training data provided — skipping classification metrics.")
-
-    # ── Run pipeline on every test image ─────────────────────────────
+    """Train classifier and evaluate on test images"""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Train classifier
+    log.info("=" * 50)
+    log.info("TRAINING CLASSIFIER")
+    log.info("=" * 50)
+    
+    unique_classes = set(train_labels)
+    if len(unique_classes) < 2:
+        log.error(f"Only {len(unique_classes)} class found! Need at least 2 classes.")
+        return {}
+    
+    log.info(f"Training on {len(train_images)} images from {len(unique_classes)} classes")
+    
+    classifier = TrafficSignClassifier()
+    train_imgs = [img for _, img in train_images]
+    
+    try:
+        train_metrics = classifier.train(train_imgs, train_labels)
+        log.info(f"Training Accuracy: {train_metrics.get('accuracy', 0):.4f}")
+    except Exception as e:
+        log.error(f"Training failed: {e}")
+        return {}
+    
+    # Run pipeline on test images
+    log.info("=" * 50)
+    log.info(f"EVALUATING ON {len(test_images)} TEST IMAGES")
+    log.info("=" * 50)
+    
     all_results = []
-    for name, img in images:
-        r = run_pipeline(
+    true_labels = []
+    pred_labels = []
+    pred_confidences = []
+    
+    for idx, (name, img) in enumerate(test_images):
+        if idx % 100 == 0 and idx > 0:
+            log.info(f"  Progress: {idx}/{len(test_images)}")
+        
+        result = run_pipeline(
             img,
             classifier=classifier,
             class_names=class_names,
@@ -104,246 +149,192 @@ def evaluate(
             image_name=name,
             verbose=False,
         )
-        all_results.append(r)
-
-    # ── 1. Classification metrics ─────────────────────────────────────
-    clf_metrics = {}
-    if classifier is not None:
-        pred_labels = []
-        for r in all_results:
-            lbl = r["pred_label"]
-            if class_names and lbl in class_names:
-                pred_labels.append(class_names.index(lbl))
-            else:
-                try:
-                    pred_labels.append(int(lbl))
-                except (ValueError, TypeError):
-                    pred_labels.append(-1)
-
-        valid_pairs = [(t, p) for t, p in zip(true_labels, pred_labels) if p != -1]
-        if valid_pairs:
-            y_true, y_pred = zip(*valid_pairs)
-            clf_metrics = {
-                "accuracy" : accuracy_score (y_true, y_pred),
-                "precision": precision_score(y_true, y_pred, average="weighted", zero_division=0),
-                "recall"   : recall_score   (y_true, y_pred, average="weighted", zero_division=0),
-                "f1"       : f1_score       (y_true, y_pred, average="weighted", zero_division=0),
-            }
-
-            # Confusion matrix
-            cm  = confusion_matrix(y_true, y_pred)
-            fig, ax = plt.subplots(figsize=(max(6, len(set(y_true))),
-                                            max(5, len(set(y_true)))))
-            ConfusionMatrixDisplay(cm, display_labels=class_names).plot(
-                ax=ax, colorbar=True, xticks_rotation="vertical")
-            ax.set_title("Confusion Matrix")
-            plt.tight_layout()
-            if output_dir:
-                cm_path = os.path.join(output_dir, "confusion_matrix.png")
-                plt.savefig(cm_path, dpi=120, bbox_inches="tight")
-                log.info("  Confusion matrix → %s", cm_path)
-            plt.close(fig)
+        all_results.append(result)
+        
+        true_label = test_labels[idx]
+        true_labels.append(true_label)
+        
+        pred = result["pred_label"]
+        pred_confidences.append(result["pred_conf"])
+        
+        if pred in class_names:
+            pred_labels.append(class_names.index(pred))
+        elif isinstance(pred, str) and pred.isdigit():
+            pred_labels.append(int(pred))
         else:
-            clf_metrics = {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0}
+            pred_labels.append(-1)
+    
+    # Calculate metrics
+    valid_mask = [p != -1 for p in pred_labels]
+    valid_true = [t for t, m in zip(true_labels, valid_mask) if m]
+    valid_pred = [p for p, m in zip(pred_labels, valid_mask) if m]
+    
+    if valid_true:
+        metrics = {
+            "accuracy": accuracy_score(valid_true, valid_pred),
+            "precision": precision_score(valid_true, valid_pred, average="weighted", zero_division=0),
+            "recall": recall_score(valid_true, valid_pred, average="weighted", zero_division=0),
+            "f1": f1_score(valid_true, valid_pred, average="weighted", zero_division=0),
+        }
+        
+        log.info("=" * 50)
+        log.info("TEST RESULTS")
+        log.info("=" * 50)
+        log.info(f"  Accuracy:  {metrics['accuracy']:.4f}")
+        log.info(f"  Precision: {metrics['precision']:.4f}")
+        log.info(f"  Recall:    {metrics['recall']:.4f}")
+        log.info(f"  F1-Score:  {metrics['f1']:.4f}")
+        
+        # FIXED: Confusion Matrix for ALL classes (no 20 class limit)
+        unique_classes = sorted(set(valid_true))
+        n_classes = len(unique_classes)
+        log.info(f"  Generating confusion matrix for {n_classes} classes...")
+        
+        # Calculate confusion matrix
+        cm = confusion_matrix(valid_true, valid_pred, labels=unique_classes)
+        
+        # Create display labels (truncated for readability)
+        display_labels = []
+        for i in unique_classes:
+            name = class_names[i] if i < len(class_names) else str(i)
+            # Truncate to 20 characters for display
+            display_labels.append(name[:18] + ".." if len(name) > 20 else name)
+        
+        # Adjust figure size based on number of classes
+        fig_size = min(25, max(10, n_classes * 0.35))
+        
+        fig, ax = plt.subplots(figsize=(fig_size, fig_size))
+        
+        # Create confusion matrix display
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=display_labels)
+        disp.plot(ax=ax, cmap='Blues', xticks_rotation='vertical', values_format='d')
+        
+        ax.set_title(f'Confusion Matrix - {n_classes} Traffic Sign Classes\n(Accuracy: {metrics["accuracy"]:.2%})', 
+                    fontsize=12, fontweight='bold')
+        ax.set_xlabel('Predicted Class', fontsize=11)
+        ax.set_ylabel('True Class', fontsize=11)
+        
+        # Adjust label size based on number of classes
+        if n_classes > 30:
+            ax.tick_params(axis='x', labelsize=6)
+            ax.tick_params(axis='y', labelsize=6)
+        elif n_classes > 20:
+            ax.tick_params(axis='x', labelsize=7)
+            ax.tick_params(axis='y', labelsize=7)
+        
+        plt.tight_layout()
+        
+        # Save confusion matrix
+        cm_path = os.path.join(output_dir, "confusion_matrix.png")
+        plt.savefig(cm_path, dpi=150, bbox_inches="tight")
+        log.info(f"  Confusion matrix saved to {cm_path}")
+        plt.close(fig)
+        
+        # Also save as text file for detailed inspection
+        cm_text_path = os.path.join(output_dir, "confusion_matrix_details.txt")
+        with open(cm_text_path, 'w', encoding='utf-8') as f:
+            f.write("CONFUSION MATRIX - DETAILED REPORT\n")
+            f.write("=" * 80 + "\n\n")
+            f.write(f"Overall Accuracy: {metrics['accuracy']:.4f}\n")
+            f.write(f"Total Test Images: {len(valid_true)}\n\n")
+            f.write("Per-Class Performance:\n")
+            f.write("-" * 80 + "\n")
+            
+            for i, cls in enumerate(unique_classes):
+                class_name = class_names[cls] if cls < len(class_names) else str(cls)
+                true_pos = cm[i, i]
+                false_pos = cm[:, i].sum() - true_pos
+                false_neg = cm[i, :].sum() - true_pos
+                precision = true_pos / (true_pos + false_pos) if (true_pos + false_pos) > 0 else 0
+                recall = true_pos / (true_pos + false_neg) if (true_pos + false_neg) > 0 else 0
+                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+                
+                f.write(f"\nClass {cls}: {class_name}\n")
+                f.write(f"  Correct: {true_pos}/{cm[i, :].sum()} ({true_pos/cm[i, :].sum()*100:.1f}%)\n")
+                f.write(f"  Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}\n")
+        
+        log.info(f"  Detailed per-class results saved to {cm_text_path}")
+        
     else:
-        clf_metrics = {"accuracy": "N/A", "precision": "N/A",
-                       "recall": "N/A", "f1": "N/A"}
-
-    # ── 2. Segmentation IoU ───────────────────────────────────────────
-    iou_scores = []
-    if gt_masks:
-        for r, gt in zip(all_results, gt_masks):
-            if gt is not None and r.get("seg_mask") is not None:
-                iou_scores.append(pixel_iou(r["seg_mask"], gt))
-    seg_iou = float(np.mean(iou_scores)) if iou_scores else "N/A (no GT masks provided)"
-
-    # ── 3. SIFT matching accuracy ─────────────────────────────────────
-    match_accs = [sift_accuracy(r["sift_good"], r["sift_total"]) for r in all_results]
-    sift_avg   = float(np.mean(match_accs)) if match_accs else 0.0
-
-    # ── 4. Harris corner statistics ───────────────────────────────────
-    counts = [len(r["corners"]) for r in all_results]
-    harris_stats = {
-        "mean": float(np.mean(counts)),
-        "std" : float(np.std (counts)),
-        "min" : int  (np.min (counts)),
-        "max" : int  (np.max (counts)),
-    }
-
-    # ── 5. Timing statistics ──────────────────────────────────────────
-    stages = ["preprocessing", "harris", "pyramid",
-              "sift", "segmentation", "classification", "total"]
+        metrics = {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0}
+        log.warning("No valid predictions to evaluate")
+    
+    # Timing stats
+    stages = ["preprocessing", "harris", "pyramid", "sift", "segmentation", "classification", "total"]
     timing = {}
-    for s in stages:
-        vals = [r["timing"].get(s, 0) for r in all_results]
-        timing[s] = {"mean_ms": float(np.mean(vals)) * 1000,
-                     "std_ms" : float(np.std (vals)) * 1000}
-
-    # ── 6. Segmentation box stats ─────────────────────────────────────
-    boxes = [r["seg_boxes"] for r in all_results]
-    seg_stats = {
-        "mean_boxes" : float(np.mean(boxes)),
-        "total_boxes": int  (sum  (boxes)),
-    }
-
-    metrics = {
-        "n_images"        : len(images),
-        "classification"  : clf_metrics,
-        "segmentation_iou": seg_iou,
-        "seg_stats"       : seg_stats,
-        "sift_match_acc"  : sift_avg,
-        "harris_stats"    : harris_stats,
-        "timing_ms"       : timing,
-    }
-
+    for stage in stages:
+        vals = [r["timing"].get(stage, 0) for r in all_results]
+        timing[stage] = {"mean_ms": np.mean(vals) * 1000, "std_ms": np.std(vals) * 1000}
+    
+    # Additional metrics
+    sift_accs = [r["sift_good"] / r["sift_total"] if r["sift_total"] > 0 else 0 for r in all_results]
+    corner_counts = [len(r["corners"]) for r in all_results]
+    box_counts = [r["seg_boxes"] for r in all_results]
+    
+    # Print final report
+    print("\n" + "═" * 70)
+    print("  FINAL EVALUATION REPORT")
+    print("═" * 70)
+    print(f"\n  Test Images:        {len(test_images)}")
+    print(f"\n  CLASSIFICATION:")
+    print(f"    Accuracy:         {metrics['accuracy']:.4f} ({metrics['accuracy']*100:.2f}%)")
+    print(f"    Precision:        {metrics['precision']:.4f}")
+    print(f"    Recall:           {metrics['recall']:.4f}")
+    print(f"    F1-Score:         {metrics['f1']:.4f}")
+    print(f"\n  SIFT MATCHING:")
+    print(f"    Avg match rate:   {np.mean(sift_accs):.4f}")
+    print(f"\n  HARRIS CORNERS:")
+    print(f"    Avg per image:    {np.mean(corner_counts):.1f} ± {np.std(corner_counts):.1f}")
+    print(f"\n  SEGMENTATION:")
+    print(f"    Avg boxes/image:  {np.mean(box_counts):.2f}")
+    print(f"    Total boxes:      {sum(box_counts)}")
+    print(f"\n  TIMING (ms per image):")
+    for stage, t in timing.items():
+        print(f"    {stage:<15} {t['mean_ms']:7.2f} ± {t['std_ms']:.2f} ms")
+    print("═" * 70)
+    
     # Save report
-    if output_dir:
-        report_path = os.path.join(output_dir, "evaluation_report.txt")
-        _write_report(metrics, report_path)
-
+    report_path = os.path.join(output_dir, "evaluation_report.txt")
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write("TRAFFIC SIGN PIPELINE - EVALUATION REPORT\n")
+        f.write("=" * 70 + "\n\n")
+        f.write(f"Test Images: {len(test_images)}\n\n")
+        f.write("CLASSIFICATION METRICS:\n")
+        f.write(f"  Accuracy:  {metrics['accuracy']:.4f} ({metrics['accuracy']*100:.2f}%)\n")
+        f.write(f"  Precision: {metrics['precision']:.4f}\n")
+        f.write(f"  Recall:    {metrics['recall']:.4f}\n")
+        f.write(f"  F1-Score:  {metrics['f1']:.4f}\n\n")
+        f.write("TIMING (ms per image):\n")
+        for stage, t in timing.items():
+            f.write(f"  {stage}: {t['mean_ms']:.2f} ± {t['std_ms']:.2f}\n")
+    
+    log.info(f"Report saved to {report_path}")
+    
     return metrics
 
 
-# ══════════════════════════════════════════════════════════════════════
-#  REPORT WRITER
-# ══════════════════════════════════════════════════════════════════════
-
-def _write_report(metrics: dict, save_path: str = None):
-    sep  = "═" * 58
-    dash = "─" * 58
-    lines = [
-        sep,
-        "  TRAFFIC SIGN PIPELINE — EVALUATION REPORT",
-        sep,
-        f"  Images evaluated : {metrics['n_images']}",
-        "",
-        "  1. CLASSIFICATION METRICS",
-        dash,
-    ]
-    for k, v in metrics["classification"].items():
-        val = f"{v:.4f}" if isinstance(v, float) else str(v)
-        lines.append(f"    {k:<14} {val}")
-
-    lines += [
-        "",
-        "  2. SEGMENTATION",
-        dash,
-    ]
-    iou = metrics["segmentation_iou"]
-    lines.append(f"    IoU            : {f'{iou:.4f}' if isinstance(iou, float) else iou}")
-    lines.append(f"    Avg boxes/img  : {metrics['seg_stats']['mean_boxes']:.2f}")
-    lines.append(f"    Total boxes    : {metrics['seg_stats']['total_boxes']}")
-
-    lines += [
-        "",
-        "  3. SIFT MATCHING",
-        dash,
-        f"    Avg match acc  : {metrics['sift_match_acc']:.4f}",
-        "",
-        "  4. HARRIS CORNERS",
-        dash,
-    ]
-    h = metrics["harris_stats"]
-    lines.append(f"    Mean ± std     : {h['mean']:.1f} ± {h['std']:.1f}")
-    lines.append(f"    Min / Max      : {h['min']} / {h['max']}")
-
-    lines += [
-        "",
-        "  5. PIPELINE TIMING (milliseconds)",
-        dash,
-    ]
-    for stage, t in metrics["timing_ms"].items():
-        lines.append(f"    {stage:<22} {t['mean_ms']:8.2f} ± {t['std_ms']:.2f} ms")
-
-    lines += ["", sep]
-    report = "\n".join(lines)
-    print("\n" + report)
-
-    if save_path:
-        with open(save_path, "w", encoding="utf-8") as f:
-            f.write(report + "\n")
-        log.info("  Report saved → %s", save_path)
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  CLI
-# ══════════════════════════════════════════════════════════════════════
-
-def build_parser():
-    p = argparse.ArgumentParser(
-        prog="evaluation.py",
-        description="Evaluate Traffic Sign pipeline — quantitative metrics.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--image_dir", required=True, 
+                       help="Directory containing class subfolders (0/, 1/, 2/, ...)")
+    parser.add_argument("--labels", required=True, help="Path to labels.csv")
+    parser.add_argument("--output_dir", default="eval_results", help="Output directory")
+    parser.add_argument("--train_ratio", type=float, default=0.7, help="Train/test split ratio")
+    args = parser.parse_args()
+    
+    log.info("Loading dataset...")
+    train_images, train_labels, test_images, test_labels, class_names = load_dataset(
+        args.image_dir, args.labels, args.train_ratio
     )
-    p.add_argument("--image_dir",  default=None)
-    p.add_argument("--labels",     default=None,
-                   help="CSV with ClassId, Name columns.")
-    p.add_argument("--output_dir", default="eval_output")
-    p.add_argument("--demo",       action="store_true",
-                   help="Run demo with 30 synthetic images — no dataset needed.")
-    return p
-
-
-def main(argv=None):
-    args = build_parser().parse_args(argv)
-
-    if args.demo:
-        log.info("Demo mode: generating synthetic traffic sign images.")
-        class_names   = ["stop_sign", "speed_limit"]
-        train_images, train_labels = [], []
-        test_images,  test_labels  = [], []
-
-        # 20 training images (10 per class)
-        for i in range(20):
-            img   = make_demo_image()
-            label = i % 2
-            if label == 1:
-                img = cv2.rectangle(img.copy(), (30, 30), (170, 170), (0, 0, 200), -1)
-            train_images.append(img)
-            train_labels.append(label)
-
-        # 10 test images
-        for i in range(10):
-            img   = make_demo_image()
-            label = i % 2
-            if label == 1:
-                img = cv2.rectangle(img.copy(), (30, 30), (170, 170), (0, 0, 200), -1)
-            test_images.append((f"test_{i:02d}", img))
-            test_labels.append(label)
-
-        metrics = evaluate(
-            images=test_images,
-            true_labels=test_labels,
-            class_names=class_names,
-            output_dir=args.output_dir,
-            train_images=train_images,
-            train_labels=train_labels,
-        )
-
-    elif args.image_dir and args.labels:
-        import pandas as pd
-        df          = pd.read_csv(args.labels)
-        class_names = sorted(df["Name"].unique().tolist())
-        exts        = {".jpg", ".jpeg", ".png", ".bmp", ".ppm"}
-        paths       = sorted(p for p in Path(args.image_dir).iterdir()
-                              if p.suffix.lower() in exts)
-        all_images  = [(p.stem, cv2.imread(str(p))) for p in paths]
-        all_images  = [(n, i) for n, i in all_images if i is not None]
-        all_labels  = [0] * len(all_images)   # replace with real labels from CSV
-
-        n_train = max(1, int(len(all_images) * 0.7))
-        metrics = evaluate(
-            images=all_images[n_train:],
-            true_labels=all_labels[n_train:],
-            class_names=class_names,
-            output_dir=args.output_dir,
-            train_images=[i for _, i in all_images[:n_train]],
-            train_labels=all_labels[:n_train],
-        )
-    else:
-        sys.exit("Use --demo  OR  --image_dir + --labels")
-
-    log.info("Done. All results in: %s/", os.path.abspath(args.output_dir))
+    
+    evaluate(
+        test_images=test_images,
+        test_labels=test_labels,
+        class_names=class_names,
+        train_images=train_images,
+        train_labels=train_labels,
+        output_dir=args.output_dir,
+    )
 
 
 if __name__ == "__main__":
